@@ -17,6 +17,10 @@ import llm_client
 
 from pathlib import Path
 from typing import Dict, List, Optional
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 # RAGAS imports
 try:
@@ -167,7 +171,7 @@ def main():
         
         # Retrieval settings
         st.subheader("🔍 Retrieval Settings")
-        n_docs = st.slider("Documents to retrieve", 1, 10, 3)
+        n_docs = st.slider("Documents to retrieve", 1, 12, 3)
         
         # Evaluation settings
         st.subheader("📊 Evaluation Settings")
