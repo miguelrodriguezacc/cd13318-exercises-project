@@ -16,11 +16,11 @@ import rag_client
 import llm_client
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
+load_dotenv()
 
 # RAGAS imports
 try:
@@ -42,6 +42,43 @@ def discover_chroma_backends() -> Dict[str, Dict[str, str]]:
 
     return rag_client.discover_chroma_backends()
 
+def get_available_missions(collection) -> Set[str]:
+    """Extract all unique missions from ChromaDB collection metadata"""
+    try:
+        all_metas = collection.get().get("metadatas", [])
+        if not all_metas:
+            return set()
+        
+        # Extract missions from metadata
+        missions = {
+            meta.get("mission", "Unknown") 
+            for meta in all_metas 
+            if meta.get("mission")
+        }
+        
+        # Remove any "unknown" entries
+        missions.discard("Unknown")
+        missions.discard("unknown")
+        
+        return sorted(missions)
+    except Exception as e:
+        st.error(f"Error extracting missions: {e}")
+        return set()
+ 
+def format_mission_display_name(mission: str) -> str:
+    """Convert mission name to user-friendly display name"""
+    # Replace underscores with spaces and capitalize
+    display_name = mission.replace("_", " ").title()
+    
+    # Handle special cases
+    special_cases = {
+        "apollo 11": "🌕 Apollo 11",
+        "apollo 13": "🌕 Apollo 13",
+        "challenger": "🚀 Challenger",
+    }
+    
+    return special_cases.get(mission.lower(), display_name)
+ 
 #@st.cache_resource
 def initialize_rag_system(chroma_dir: str, collection_name: str):
     """Initialize the RAG system with specified backend (cached for performance)"""
@@ -120,6 +157,10 @@ def main():
         st.session_state.last_evaluation = None
     if "last_contexts" not in st.session_state:
         st.session_state.last_contexts = []
+    if "available_missions" not in st.session_state:
+        st.session_state.available_missions = []
+    if "selected_mission" not in st.session_state:
+        st.session_state.selected_mission = None
     
     # Sidebar for configuration
     with st.sidebar:
@@ -160,6 +201,8 @@ def main():
             st.warning("Please enter your OpenAI API key")
             st.stop()
         else:
+            # Ensure all components use the same API key
+            os.environ["OPENAI_API_KEY"] = openai_key
             os.environ["CHROMA_OPENAI_API_KEY"] = openai_key
         
         # Model selection
@@ -187,19 +230,95 @@ def main():
     with st.spinner("Initializing RAG system..."):
 
         collection, success, error = initialize_rag_system(
-            selected_backend["directory"], 
-            selected_backend["collection_name"]
+            selected_backend["directory"],
+            selected_backend["collection_name"],
         )
     
     if not success:
         st.error(f"Failed to initialize RAG system: {error}")
         st.stop()
+
+    # Discover available missions from the collection
+    with st.spinner("Loading available missions..."):
+        available_missions = get_available_missions(collection)
     
     # Display evaluation metrics if available
     if st.session_state.last_evaluation and enable_evaluation:
         display_evaluation_metrics(st.session_state.last_evaluation)
-    
-    # Display chat messages
+
+    # Mission filter selector with improved UX
+    st.sidebar.subheader("🎯 Mission Filter")
+
+    if available_missions:
+        # Create options: "All Missions" + individual missions
+        mission_options = ["📋 All Missions"] + [
+            format_mission_display_name(m) for m in available_missions
+        ]
+        
+        # Create mapping for filter values
+        mission_map = {"📋 All Missions": None}
+        for mission in available_missions:
+            mission_map[format_mission_display_name(mission)] = mission
+        
+        # Display missions in a nice format
+        st.sidebar.write(f"**Available Missions:** {len(available_missions)}")
+        selected_display = st.sidebar.selectbox(
+            "Select a mission to search:",
+            options=mission_options,
+            index=0,
+            help="Choose a specific mission or search all missions"
+        )
+        
+        # Get the actual mission filter value
+        mission_filter = mission_map.get(selected_display, None)
+        
+        # Display selected mission info
+        if mission_filter:
+            st.sidebar.success(f"✅ Searching in: {format_mission_display_name(mission_filter)}")
+        else:
+            st.sidebar.info("📋 Searching in all missions")
+        
+        # Store mission selection in session state
+        st.session_state.selected_mission = mission_filter
+    else:
+        st.sidebar.warning("No missions found in the collection. Check your data.")
+        mission_filter = None
+ 
+    # Offer mission filter to narrow retrieval results
+    # (uses metadata stored in the collection)
+    #try:
+    #    all_metas = collection.get().get("metadatas", [])
+    #    print(all_metas)
+    #    raw_missions = sorted({m.get("mission", "unknown") for m in (all_metas or [])})
+    #    
+    #    # Create user-friendly display names
+    #    mission_display_map = {
+    #        "apollo_11": "Apollo 11",
+    #        "apollo_13": "Apollo 13", 
+    #        "challenger": "Challenger"
+    #    }
+    #    
+    #    # Map raw mission names to display names for the selectbox
+    #    display_missions = ["all"] + [mission_display_map.get(m, m.replace("_", "").title()) for m in raw_missions if m != "unknown"]
+    #    
+    #    # Create reverse mapping for filtering
+    #    filter_map = {mission_display_map.get(m, m): m for m in raw_missions if m != "unknown"}
+    #    
+    #    selected_display = st.sidebar.selectbox(
+    #        "Mission filter",
+    #        options=["all"] + list(set(display_missions[1:])),  # Remove duplicates
+    #        index=0,
+    #        help="Restrict retrieval to a specific mission (or all).",
+    #    )
+    #    
+    #    # Convert display name back to metadata value for filtering
+    #    mission_filter = filter_map.get(selected_display, selected_display.lower().replace(" ", "_"))
+    #    
+    #except Exception as e:
+    #    st.sidebar.error(f"Error loading mission filter: {e}")
+    #    mission_filter = "all"
+#
+    ## Display chat messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -216,19 +335,28 @@ def main():
             with st.spinner("Searching documents and generating response..."):
                 # Retrieve relevant documents
                 docs_result = retrieve_documents(
-                    collection, 
-                    prompt, 
-                    n_docs
+                    collection,
+                    prompt,
+                    n_docs,
+                    mission_filter=mission_filter,
                 )
                 
                 # Format context
                 context = ""
                 contexts_list = []
+                documents_count = 0
                 if docs_result and docs_result.get("documents"):
-                    context = format_context(docs_result["documents"][0], docs_result["metadatas"][0])
+                    context = format_context(docs_result["documents"][0], docs_result.get("metadatas", [[]])[0])
+                    documents_count = len(docs_result["documents"][0])
                     contexts_list = docs_result["documents"][0]
                     st.session_state.last_contexts = contexts_list
-                
+
+                    # Display retrieval info
+                    st.info(f"📚 Retrieved {documents_count} document(s)" + 
+                           (f" from {format_mission_display_name(mission_filter)}" if mission_filter else ""))
+                else:
+                    st.warning("⚠️ No relevant documents found for this query.")
+
                 # Generate response
                 response = generate_response(
                     openai_key, 

@@ -30,7 +30,7 @@ from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -67,17 +67,23 @@ class ChromaEmbeddingPipelineTextOnly:
         # TODO: Initialize OpenAI client
         self.openai_client = OpenAI(
             api_key=openai_api_key,
-            base_url="https://openai.vocareum.com/v1" if openai_api_key.startswith("voc") else None)
+            base_url="https://openai.vocareum.com/v1" if openai_api_key.startswith("voc") else None
+            )
         # TODO: Store configuration parameters
         self.chroma_persist_directory = chroma_persist_directory
         self.collection_name = collection_name
         self.embedding_model = embedding_model
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.embedding_fn = OpenAIEmbeddingFunction(
+            api_key=openai_api_key,
+            model_name=embedding_model,
+            api_base="https://openai.vocareum.com/v1" if openai_api_key.startswith("voc") else None
+            )
         # TODO: Initialize ChromaDB client
         self.chroma_client = chromadb.PersistentClient(path=chroma_persist_directory)
         # TODO: Create or get collection
-        self.collection = self.chroma_client.get_or_create_collection(name=collection_name)
+        self.collection = self.chroma_client.get_or_create_collection(name=collection_name, embedding_function=self.embedding_fn)
     
     def chunk_text(self, text: str, metadata: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
         """
@@ -117,9 +123,12 @@ class ChromaEmbeddingPipelineTextOnly:
             chunks.append((chunk_text, chunk_metadata))
 
             # Advance with overlap
-            start = end - self.chunk_overlap
-            if start < 0:
-                start = 0
+            next_start = end - self.chunk_overlap
+            if next_start <= start:
+                start = end
+            else:
+                start = next_start
+
             chunk_index += 1
 
         # TODO: Create metadata for each chunk
@@ -137,8 +146,25 @@ class ChromaEmbeddingPipelineTextOnly:
         """
         # TODO: Query collection for document ID
         result = self.collection.get(ids=[doc_id])
+        existing_ids = set(self.collection.get()['ids'])
         # TODO: Return True if exists, False otherwise
         return len(result.get('ids', [])) > 0
+
+    def get_existing_ids_set(self) -> set:
+        """
+        Return the full set of document IDs currently stored in the collection.
+        Calling this once and reusing the result avoids N individual DB queries
+        (one per chunk) that were the primary cause of slow startup.
+        
+        Returns:
+            Set of document ID strings
+        """
+        try:
+            result = self.collection.get(include=[])   # fetch only IDs, no documents/embeddings
+            return set(result.get('ids', []))
+        except Exception as e:
+            logger.error(f"Error loading existing IDs: {e}")
+            return set()
     
     def update_document(self, doc_id: str, text: str, metadata: Dict[str, Any]) -> bool:
         """
@@ -168,6 +194,37 @@ class ChromaEmbeddingPipelineTextOnly:
         except Exception as e:
             logger.error(f"Error updating document {doc_id}: {e}")
             return False
+        
+    def update_documents_batch(self, ids: List[str], texts: List[str],
+                               metadatas: List[Dict[str, Any]]) -> int:
+        """
+        Update a batch of existing documents using a single OpenAI embedding
+        request instead of one request per document.
+ 
+        Args:
+            ids:       List of document IDs to update
+            texts:     Corresponding new text contents
+            metadatas: Corresponding new metadata dicts
+ 
+        Returns:
+            Number of documents successfully updated
+        """
+        if not ids:
+            return 0
+        try:
+            embeddings = self.get_embeddings_batch(texts)
+            if not embeddings:
+                return 0
+            self.collection.update(
+                ids=ids,
+                documents=texts,
+                metadatas=metadatas,
+                embeddings=embeddings
+            )
+            return len(ids)
+        except Exception as e:
+            logger.error(f"Error batch-updating documents: {e}")
+            return 0
     
     def delete_documents_by_source(self, source_pattern: str) -> int:
         """
@@ -258,6 +315,37 @@ class ChromaEmbeddingPipelineTextOnly:
             logger.error(f"Error fetching embedding: {e}")
             return []
 
+    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """
+        Get OpenAI embeddings for a list of texts in a single API call.
+        The OpenAI embeddings endpoint accepts up to 2 048 inputs at once,
+        so batching here cuts the number of HTTP round-trips from N (one per
+        chunk) down to ceil(N / batch_size) — typically just 1-2 calls for a
+        typical document corpus.
+ 
+        Args:
+            texts: List of text strings to embed
+ 
+        Returns:
+            List of embedding vectors in the same order as the input texts.
+            Returns an empty list if the API call fails.
+        """
+        if not texts:
+            return []
+        try:
+            response = self.openai_client.embeddings.create(
+                input=texts,
+                model=self.embedding_model
+            )
+            if not getattr(response, 'data', None):
+                logger.error("No embeddings returned from OpenAI batch call")
+                return []
+            # The API guarantees results are returned in input order
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            logger.error(f"Error fetching embeddings batch: {e}")
+            return []
+        
     def generate_document_id(self, file_path: Path, metadata: Dict[str, Any]) -> str:
         """
         Generate stable document ID based on file path and chunk position
@@ -311,14 +399,28 @@ class ChromaEmbeddingPipelineTextOnly:
     def extract_mission_from_path(self, file_path: Path) -> str:
         """Extract mission name from file path"""
         path_str = str(file_path).lower()
-        if 'apollo11' in path_str or 'apollo_11' in path_str:
+        file_name = file_path.name.lower()
+        # Normalize the path string by removing special characters
+        normalized = path_str.replace(' ', '').replace('-', '').replace('_', '')
+
+        if 'apollo11' in normalized or 'apollo_11' in normalized:
             return 'apollo_11'
-        elif 'apollo13' in path_str or 'apollo_13' in path_str:
+        elif 'apollo13' in normalized or 'apollo_13' in normalized:
             return 'apollo_13'
-        elif 'challenger' in path_str:
+        elif 'challenger' in normalized:
             return 'challenger'
-        else:
-            return 'unknown'
+        
+        parent_folder = file_path.parent.name.lower().replace(' ', '').replace('-', '').replace('_', '')
+        
+        if 'apollo11' in parent_folder:
+            return 'apollo_11'
+        elif 'apollo13' in parent_folder:
+            return 'apollo_13'
+        elif 'challenger' in parent_folder:
+            return 'challenger'
+        
+        logger.warning(f"Could not determine mission for file: {file_path}")
+        return 'unknown'
     
     def extract_data_type_from_path(self, file_path: Path) -> str:
         """Extract data type from file path"""
@@ -365,6 +467,54 @@ class ChromaEmbeddingPipelineTextOnly:
             return 'complete_document'
         else:
             return 'general_document'
+        
+    def discover_mission_folders(self, base_path: str) -> Dict[str, Path]:
+        """
+        Discover mission folders in the data_text directory and classify them
+        
+        Args:
+            base_path: Base directory path
+            
+        Returns:
+            Dictionary mapping mission names to their folder paths
+        """
+        base_path = Path(base_path)
+        data_text_dir = base_path / 'data_text'
+        
+        mission_folders = {}
+        
+        if not data_text_dir.exists():
+            logger.warning(f"data_text directory not found at {data_text_dir}")
+            return mission_folders
+        
+        logger.info(f"Discovering mission folders in: {data_text_dir}")
+        
+        # List all subdirectories in data_text
+        for folder in data_text_dir.iterdir():
+            if not folder.is_dir():
+                continue
+            
+            folder_name = folder.name.lower().replace(' ', '').replace('-', '').replace('_', '')
+            
+            # Classify the folder
+            if 'apollo11' in folder_name:
+                mission_folders['apollo_11'] = folder
+                logger.info(f"  Found Apollo 11 folder: {folder.name}")
+            elif 'apollo13' in folder_name:
+                mission_folders['apollo_13'] = folder
+                logger.info(f"  Found Apollo 13 folder: {folder.name}")
+            elif 'challenger' in folder_name:
+                mission_folders['challenger'] = folder
+                logger.info(f"  Found Challenger folder: {folder.name}")
+            else:
+                logger.info(f"  Skipping unrecognized folder: {folder.name}")
+        
+        if not mission_folders:
+            logger.warning("No recognized mission folders found in data_text/")
+            logger.info("Expected folders containing: apollo_11, apollo_13, or challenger")
+        
+        return mission_folders
+    
     
     def scan_text_files_only(self, base_path: str) -> List[Path]:
         """
@@ -380,21 +530,21 @@ class ChromaEmbeddingPipelineTextOnly:
         files_to_process = []
         
         # Define directories to scan
-        data_dirs = [
-            'data_text/apollo11',
-            'data_text/apollo13',
-            'data_text/challenger'
-        ]
+                # Discover mission folders automatically
+        mission_folders = self.discover_mission_folders(base_path)
         
-        for data_dir in data_dirs:
-            dir_path = base_path / data_dir
-            if dir_path.exists():
-                logger.info(f"Scanning directory: {dir_path}")
-                
-                # Find only text files
-                text_files = list(dir_path.glob('**/*.txt'))
-                files_to_process.extend(text_files)
-                logger.info(f"Found {len(text_files)} text files in {data_dir}")
+        if not mission_folders:
+            logger.error("No mission folders found. Cannot proceed.")
+            return []
+        
+        # Scan each mission folder for text files
+        for mission, dir_path in mission_folders.items():
+            logger.info(f"Scanning directory for {mission}: {dir_path}")
+            
+            # Find only text files
+            text_files = list(dir_path.glob('**/*.txt'))
+            files_to_process.extend(text_files)
+            logger.info(f"  Found {len(text_files)} text files in {mission}")
         
         # Filter out unwanted files
         filtered_files = []
@@ -415,7 +565,7 @@ class ChromaEmbeddingPipelineTextOnly:
             mission_counts[mission] = mission_counts.get(mission, 0) + 1
         
         logger.info("Files by mission:")
-        for mission, count in mission_counts.items():
+        for mission, count in sorted(mission_counts.items()):
             logger.info(f"  {mission}: {count} files")
         
         return filtered_files
@@ -448,23 +598,17 @@ class ChromaEmbeddingPipelineTextOnly:
             self.delete_documents_by_source(file_path.stem)
         
         # TODO: Process documents in batches
-        batch_ids, batch_docs, batch_metas, batch_embeddings = [], [], [], []
+        existing_ids: set = self.get_existing_ids_set()
+        logger.debug(f"Loaded {len(existing_ids)} existing IDs from collection")
  
-        def flush_batch():
-            nonlocal batch_ids, batch_docs, batch_metas, batch_embeddings
-            if not batch_ids:
-                return
-            try:
-                self.collection.add(
-                    ids=batch_ids,
-                    documents=batch_docs,
-                    metadatas=batch_metas,
-                    embeddings=batch_embeddings
-                )
-                stats['added'] += len(batch_ids)
-            except Exception as e:
-                logger.error(f"Error adding batch to collection: {e}")
-            batch_ids, batch_docs, batch_metas, batch_embeddings = [], [], [], []
+        # Separate documents into three buckets
+        to_add_ids:    List[str]            = []
+        to_add_texts:  List[str]            = []
+        to_add_metas:  List[Dict[str, Any]] = []
+ 
+        to_update_ids:    List[str]            = []
+        to_update_texts:  List[str]            = []
+        to_update_metas:  List[Dict[str, Any]] = []
 
         # TODO: For each document:
         #   - Generate document ID
@@ -473,34 +617,59 @@ class ChromaEmbeddingPipelineTextOnly:
         #   - Add or update in collection
         for text, metadata in documents:
             doc_id = self.generate_document_id(file_path, metadata)
-            exists = self.check_document_exists(doc_id)
+            exists = doc_id in existing_ids
 
-            if exists and update_mode == 'skip':
-                stats['skipped'] += 1
+            if exists:
+                if update_mode == 'skip':
+                    stats['skipped'] += 1
+                elif update_mode == 'update':
+                    to_update_ids.append(doc_id)
+                    to_update_texts.append(text)
+                    to_update_metas.append(metadata)
+                # 'replace' already deleted old docs, so treat as new
+                else:
+                    to_add_ids.append(doc_id)
+                    to_add_texts.append(text)
+                    to_add_metas.append(metadata)
+            else:
+                to_add_ids.append(doc_id)
+                to_add_texts.append(text)
+                to_add_metas.append(metadata)
+
+        for i in range(0, len(to_add_ids), batch_size):
+            batch_ids   = to_add_ids[i:i + batch_size]
+            batch_texts = to_add_texts[i:i + batch_size]
+            batch_metas = to_add_metas[i:i + batch_size]
+ 
+            logger.debug(f"Embedding add-batch {i // batch_size + 1}: {len(batch_ids)} chunks")
+            embeddings = self.get_embeddings_batch(batch_texts)
+ 
+            if not embeddings:
+                logger.error(f"Failed to get embeddings for add-batch starting at index {i}")
+                stats['skipped'] += len(batch_ids)
                 continue
-
-            # Create embedding for this chunk
-            embedding = self.get_embedding(text)
-            if not embedding:
-                stats['skipped'] += 1
-                continue
-
-            if exists and update_mode == 'update':
-                updated = self.update_document(doc_id, text, metadata)
-                stats['updated'] += 1 if updated else 0
-                continue
-
-            # Add to batch for insertion
-            batch_ids.append(doc_id)
-            batch_docs.append(text)
-            batch_metas.append(metadata)
-            batch_embeddings.append(embedding)
-
-            if len(batch_ids) >= batch_size:
-                flush_batch()
-
-        # Flush remaining batch
-        flush_batch()
+ 
+            try:
+                self.collection.add(
+                    ids=batch_ids,
+                    documents=batch_texts,
+                    metadatas=batch_metas,
+                    embeddings=embeddings
+                )
+                stats['added'] += len(batch_ids)
+            except Exception as e:
+                logger.error(f"Error adding batch to collection: {e}")
+                stats['skipped'] += len(batch_ids)
+ 
+        # --- FIX 2b: batch-embed and update existing documents ------------------
+        for i in range(0, len(to_update_ids), batch_size):
+            batch_ids   = to_update_ids[i:i + batch_size]
+            batch_texts = to_update_texts[i:i + batch_size]
+            batch_metas = to_update_metas[i:i + batch_size]
+ 
+            logger.debug(f"Embedding update-batch {i // batch_size + 1}: {len(batch_ids)} chunks")
+            updated = self.update_documents_batch(batch_ids, batch_texts, batch_metas)
+            stats['updated'] += updated
 
         # TODO: Return statistics
         return stats
@@ -732,6 +901,23 @@ def main():
     collection_info = pipeline.get_collection_info()
     logger.info(f"\nCollection: {collection_info.get('collection_name', 'N/A')}")
     logger.info(f"Total documents in collection: {collection_info.get('document_count', 'N/A')}")
+
+    logger.info("\n" + "=" * 70)
+    logger.info("✅ VERIFICATION: Checking 'mission' field in metadata")
+    logger.info("=" * 70)
+    
+    # Verify mission field exists
+    stats = pipeline.get_collection_stats()
+    if 'missions' in stats:
+        missions = stats.get('missions', {})
+        logger.info(f"Missions found in collection: {list(missions.keys())}")
+        for mission, count in missions.items():
+            logger.info(f"  {mission}: {count} documents")
+        
+        if 'unknown' in missions:
+            logger.warning(f"⚠️  Found {missions['unknown']} documents with mission='unknown'")
+        else:
+            logger.info("✅ All documents have valid mission assignments")
     
     # Test query if provided
     if args.test_query:

@@ -15,27 +15,38 @@ try:
 except ImportError:
     RAGAS_AVAILABLE = False
 
-def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -> Dict[str, float]:
-    """Evaluate response quality using RAGAS metrics"""
+def evaluate_response_quality(
+    question: str,
+    answer: str,
+    contexts: List[str],
+    reference: Optional[str] = None,
+) -> Dict[str, float]:
+    """Evaluate response quality using RAGAS metrics.
+
+    If `reference` is provided, it is used for reference-based metrics like BLEU.
+    Otherwise, `answer` is used as reference (which makes BLEU perfect).
+    """
     if not RAGAS_AVAILABLE:
         return {"error": "RAGAS not available"}
     
     # TODO: Create evaluator LLM with model gpt-3.5-turbo
+    reference_text = reference or answer
     evaluator_llm = LangchainLLMWrapper(
         ChatOpenAI(
             model="gpt-3.5-turbo",
             openai_api_key=os.getenv("OPENAI_API_KEY"),
-            openai_api_base="https://openai.vocareum.com/v1" if os.getenv("OPENAI_API_KEY", "").startswith("voc") else None
-            )
+            openai_api_base="https://openai.vocareum.com/v1" if os.getenv("OPENAI_API_KEY", "").startswith("voc") else None,
         )
+    )
     # TODO: Create evaluator_embeddings with model test-embedding-3-small
     evaluator_embeddings = LangchainEmbeddingsWrapper(
         OpenAIEmbeddings(
             model="text-embedding-3-small",
             openai_api_key=os.getenv("OPENAI_API_KEY"),
-            openai_api_base="https://openai.vocareum.com/v1" if os.getenv("OPENAI_API_KEY", "").startswith("voc") else None
-            )
+            openai_api_base="https://openai.vocareum.com/v1" if os.getenv("OPENAI_API_KEY", "").startswith("voc") else None,
         )
+    )
+    
     # TODO: Define an instance for each metric to evaluate
     bleu = BleuScore()
     context_precision = NonLLMContextPrecisionWithReference()
@@ -43,15 +54,17 @@ def evaluate_response_quality(question: str, answer: str, contexts: List[str]) -
     faithfulness = Faithfulness(llm=evaluator_llm)
     rouge = RougeScore()
 
-    # Build an EvaluationDataset from a single sample
-    dataset = EvaluationDataset.from_list([
-        {
-            "user_input": question,
-            "response": answer,
-            "reference": answer,
-            "retrieved_contexts": contexts,            
-            "reference_contexts": contexts,        }
-    ])
+    dataset = EvaluationDataset.from_list(
+        [
+            {
+                "user_input": question,
+                "response": answer,
+                "reference": reference_text,
+                "retrieved_contexts": contexts,
+                "reference_contexts": contexts,
+            }
+        ]
+    )
 
     # Evaluate the response using the metrics
     result = evaluate(

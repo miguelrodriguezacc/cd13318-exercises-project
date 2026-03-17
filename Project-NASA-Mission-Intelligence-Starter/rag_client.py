@@ -1,5 +1,8 @@
+import os
+
 import chromadb
 from chromadb.config import Settings
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from typing import Dict, List, Optional
 from pathlib import Path
 
@@ -56,21 +59,46 @@ def discover_chroma_backends() -> Dict[str, Dict[str, str]]:
     # Return complete backends dictionary with all discovered collections
     return backends
 
-def initialize_rag_system(chroma_dir: str, collection_name: str):
-    """Initialize the RAG system with specified backend (cached for performance)"""
+def initialize_rag_system(
+    chroma_dir: str,
+    collection_name: str,
+    openai_api_key: Optional[str] = None,
+    embedding_model: str = "text-embedding-3-small",
+):
+    """Initialize the RAG system with specified backend (cached for performance)."""
+
+    # Prefer explicit key, else use environment variable
+    openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY", "")
+
+    # Setup embedding function so Chroma and the pipeline use the same embedding dimensions
+    api_base = "https://openai.vocareum.com/v1" if openai_api_key.startswith("voc") else None
+    embedding_fn = OpenAIEmbeddingFunction(
+        api_key=openai_api_key,
+        model_name=embedding_model,
+        api_base=api_base
+    )
+
     try:
-    # Create a chromadb persistent client
+        # Create a chromadb persistent client
         client = chromadb.PersistentClient(path=chroma_dir)
-        # Return the collection with the collection_name
-        collection = client.get_collection(name=collection_name)
+
+        # Create or get collection and ensure it uses the same embedding function
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=embedding_fn,
+        )
         return collection, True, None
     except Exception as e:
         print(f"Error initializing RAG system: {e}")
         return None, False, str(e)
 
-def retrieve_documents(collection, query: str, n_results: int = 3, 
-                      mission_filter: Optional[str] = None) -> Optional[Dict]:
-    """Retrieve relevant documents from ChromaDB with optional filtering"""
+def retrieve_documents(
+    collection,
+    query: str,
+    n_results: int = 3,
+    mission_filter: Optional[str] = None,
+) -> Optional[Dict]:
+    """Retrieve relevant documents from ChromaDB with optional filtering."""
 
     # TODO: Initialize filter variable to None (represents no filtering)
     filter_dict = None
@@ -83,6 +111,7 @@ def retrieve_documents(collection, query: str, n_results: int = 3,
         # TODO: Pass search query in the required format
         # TODO: Set maximum number of results to return
         # TODO: Apply conditional filter (None for no filtering, dictionary for specific filtering)
+
     results = collection.query(
         query_texts=[query],
         n_results=n_results,
@@ -105,9 +134,10 @@ def format_context(documents: List[str], metadatas: List[Dict]) -> str:
         # TODO: Extract category information from metadata with fallback value
         # TODO: Clean up category name formatting (replace underscores, capitalize)
     for idx, (doc, meta) in enumerate(zip(documents, metadatas)):
+        print(documents, metadatas)
         mission = meta.get("mission", "Unknown Mission").replace("_", " ").title()
         source = meta.get("source", "Unknown Source")
-        category = meta.get("category", "Unknown Category").replace("_", " ").title()    
+        category = meta.get("document_category", "Unknown Category").replace("_", " ").title()    
         # TODO: Create formatted source header with index number and extracted information
         header = f"Document {idx+1}: {mission} - {category} (Source: {source})"
         # TODO: Add source header to context parts list
@@ -120,3 +150,30 @@ def format_context(documents: List[str], metadatas: List[Dict]) -> str:
 
     # TODO: Join all context parts with newlines and return formatted string
     return "\n\n".join(context_parts)
+
+def get_all_missions(collection) -> List[str]:
+    """Extract all unique missions from collection metadata
+    
+    Args:
+        collection: ChromaDB collection object
+    
+    Returns:
+        Sorted list of unique mission names found in metadata
+    """
+    try:
+        all_metas = collection.get().get("metadatas", [])
+        if not all_metas:
+            return []
+        
+        # Extract missions from metadata, removing None and "unknown" values
+        missions = sorted({
+            meta.get("mission") 
+            for meta in all_metas 
+            if meta.get("mission") and meta.get("mission").lower() != "unknown"
+        })
+        
+        return missions
+    except Exception as e:
+        print(f"Error extracting missions from collection: {e}")
+        return []
+ 
