@@ -283,42 +283,8 @@ def main():
     else:
         st.sidebar.warning("No missions found in the collection. Check your data.")
         mission_filter = None
- 
-    # Offer mission filter to narrow retrieval results
-    # (uses metadata stored in the collection)
-    #try:
-    #    all_metas = collection.get().get("metadatas", [])
-    #    print(all_metas)
-    #    raw_missions = sorted({m.get("mission", "unknown") for m in (all_metas or [])})
-    #    
-    #    # Create user-friendly display names
-    #    mission_display_map = {
-    #        "apollo_11": "Apollo 11",
-    #        "apollo_13": "Apollo 13", 
-    #        "challenger": "Challenger"
-    #    }
-    #    
-    #    # Map raw mission names to display names for the selectbox
-    #    display_missions = ["all"] + [mission_display_map.get(m, m.replace("_", "").title()) for m in raw_missions if m != "unknown"]
-    #    
-    #    # Create reverse mapping for filtering
-    #    filter_map = {mission_display_map.get(m, m): m for m in raw_missions if m != "unknown"}
-    #    
-    #    selected_display = st.sidebar.selectbox(
-    #        "Mission filter",
-    #        options=["all"] + list(set(display_missions[1:])),  # Remove duplicates
-    #        index=0,
-    #        help="Restrict retrieval to a specific mission (or all).",
-    #    )
-    #    
-    #    # Convert display name back to metadata value for filtering
-    #    mission_filter = filter_map.get(selected_display, selected_display.lower().replace(" ", "_"))
-    #    
-    #except Exception as e:
-    #    st.sidebar.error(f"Error loading mission filter: {e}")
-    #    mission_filter = "all"
-#
-    ## Display chat messages
+
+    # Display chat messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])

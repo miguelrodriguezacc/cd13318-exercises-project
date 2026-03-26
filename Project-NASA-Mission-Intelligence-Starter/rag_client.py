@@ -134,7 +134,6 @@ def format_context(documents: List[str], metadatas: List[Dict]) -> str:
         # TODO: Extract category information from metadata with fallback value
         # TODO: Clean up category name formatting (replace underscores, capitalize)
     for idx, (doc, meta) in enumerate(zip(documents, metadatas)):
-        print(documents, metadatas)
         mission = meta.get("mission", "Unknown Mission").replace("_", " ").title()
         source = meta.get("source", "Unknown Source")
         category = meta.get("document_category", "Unknown Category").replace("_", " ").title()    
@@ -151,29 +150,3 @@ def format_context(documents: List[str], metadatas: List[Dict]) -> str:
     # TODO: Join all context parts with newlines and return formatted string
     return "\n\n".join(context_parts)
 
-def get_all_missions(collection) -> List[str]:
-    """Extract all unique missions from collection metadata
-    
-    Args:
-        collection: ChromaDB collection object
-    
-    Returns:
-        Sorted list of unique mission names found in metadata
-    """
-    try:
-        all_metas = collection.get().get("metadatas", [])
-        if not all_metas:
-            return []
-        
-        # Extract missions from metadata, removing None and "unknown" values
-        missions = sorted({
-            meta.get("mission") 
-            for meta in all_metas 
-            if meta.get("mission") and meta.get("mission").lower() != "unknown"
-        })
-        
-        return missions
-    except Exception as e:
-        print(f"Error extracting missions from collection: {e}")
-        return []
- 

@@ -93,6 +93,15 @@ def main():
         "retrieved_docs",
     ]
 
+    total_metrics = {
+        "bleu_score": 0.0,
+        "context_precision": 0.0,
+        "response_relevancy": 0.0,
+        "faithfulness": 0.0,
+        "rouge_score": 0.0
+    }
+    count = 0
+
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -139,39 +148,57 @@ def main():
                     if k in scores and scores[k] is not None:
                         return scores[k]
                 return None
+        
+            def get_safe_score(*keys):
+                for k in keys:
+                    val = scores.get(k)
+                    if val is not None:
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            continue
+                return 0.0
 
-            # Print keys once to help diagnose missing columns (only first item)
-            if item == items[0]:
-                print("Evaluation keys:", list(scores.keys()))
+            # Extract metrics for this row, trying multiple possible keys for each metric to handle variations in RAGAS output
+            row_metrics = {
+                "bleu_score": get_safe_score("bleu_score", "BLEU", "bleu"),
+                "context_precision": get_safe_score("non_llm_context_precision_with_reference", "context_precision"),
+                "response_relevancy": get_safe_score("response_relevancy", "response_relevancy_score"),
+                "faithfulness": get_safe_score("faithfulness", "faithfulness_score"),
+                "rouge_score": get_safe_score("rouge_score", "rouge_l", "rouge_1")
+            }
+
+            # Totalize metrics for average calculation
+            for key in total_metrics:
+                total_metrics[key] += row_metrics[key]
+            count += 1
 
             writer.writerow({
                 "question": question,
                 "reference": reference,
                 "prediction": prediction,
-                "bleu_score": first_present("bleu_score", "BLEU", "bleu"),
-                "context_precision": first_present(
-                    "non_llm_context_precision_with_reference",
-                    "non_llm_context_precision",
-                    "context_precision",
-                ),
-                "response_relevancy": first_present(
-                    "response_relevancy",
-                    "response_relevancy_score",
-                ),
-                "faithfulness": first_present(
-                    "faithfulness",
-                    "faithfulness_score",
-                ),
-                "rouge_score": first_present(
-                    "rouge_score",
-                    "rouge_l",
-                    "rouge_1",
-                    "rouge_2",
-                ),
+                **row_metrics,
                 "retrieved_docs": len(documents) if documents else 0,
             })
 
-    print(f"Evaluation complete. Results written to {args.output}")
+        if count > 0:
+            averages = {k: v / count for k, v in total_metrics.items()}
+            
+            # Escribir una fila vacía y luego los promedios al final del CSV
+            writer.writerow({k: "" for k in fieldnames}) 
+            writer.writerow({
+                "question": "TOTAL AVERAGE",
+                "reference": "-",
+                "prediction": "-",
+                **averages,
+                "retrieved_docs": "-"
+            })
+
+            print("\n=== Resumen de Métricas Totales ===")
+            for metric, value in averages.items():
+                print(f"{metric.replace('_', ' ').title()}: {value:.4f}")
+    
+    print(f"\nEvaluation complete. Results written to {args.output}")
 
 
 if __name__ == "__main__":
